@@ -1,0 +1,337 @@
+% %% Compare sequential solver to fully implicit, applied to the SPE1 problem
+% % This example simulates the first SPE benchmark using both sequential and
+% % fully implicit solvers. The problem is a gas injection with significant
+% % density and mobility changes between phases, so the assumption of a
+% % constant total velocity for the sequential scheme is violated, and there
+% % are differences in production profiles between the two schemes. We also
+% % test a third approach, wherein the sequential scheme revisits the
+% % pressure solution if the mobilities change significantly, in order to
+% % convergence to the fully implicit solution.
+% 
+% mrstModule add ad-core ad-blackoil ad-props
+% 
+% %% Set up the initial simulation model
+% % We use the existing setupSPE1 routine to handle the setup of all
+% % parameters, which are then converted into a fully implicit model and a
+% % schedule.
+% [G, rock, fluid, deck, state] = setupSPE1();
+% 
+% model = selectModelFromDeck(G, rock, fluid, deck);
+% schedule = convertDeckScheduleToMRST(model, deck);
+% 
+% 
+%%
+
+close all
+clear all
+clc
+% %Linear Solvers
+% try
+%     mrstModule add agmg
+%     1
+%     %pressureSolver = BackslashSolverAD();
+%     %pressureSolver = AGMGSolverAD('tolerance', 1e-4);
+%     %pressureSolver = GMRES_ILUSolverAD('tolerance', 1e-4,'maxIterations', 1000);
+%      pressureSolver = PCG_ICSolverAD('tolerance', 1e-4,'maxIterations', 1000);
+% catch
+%   %  pressureSolver = AGMGSolverAD('tolerance', 1e-4);
+%     %pressureSolver = BackslashSolverAD();
+% end
+
+%% Grid and rock properties
+mrstModule add mrst-gui;        % plotting routines
+mrstModule add ad-props ad-core % AD framework
+mrstModule add ad-blackoil      % Three phase simulator
+
+[nx,ny,nz] = deal( 20, 20, 1);
+[Lx,Ly,Lz] = deal(200, 200, 50);
+G = cartGrid([nx, ny, nz], [Lx, Ly, Lz ]);
+G = computeGeometry(G);
+nzz = 8;
+Gt = cartGrid([1, 1, 1], [200, 200, nzz*Lz/nz ]);
+Gt = computeGeometry(Gt); Gb = Gt;
+Gb.nodes.coords(:,3) = [30; 30; 30; 30; 50; 50; 50; 50];
+
+%% Layers
+
+bottomlayer = G.cells.num-nx*ny*nzz+1:G.cells.num;
+toplayer = 1:nx*ny*nzz;
+middlelayer = setdiff(1:G.cells.num,[toplayer,bottomlayer]);
+rock.perm = repmat(30*milli*darcy, [G.cells.num, 1]);
+% rock.perm(toplayer) = 150*milli*darcy;
+% rock.perm(bottomlayer) = 150*milli*darcy;
+rock.poro = repmat(0.2 , [G.cells.num, 1]);
+% rock.poro(toplayer) = 0.3;
+% rock.poro(bottomlayer) = 0.3;
+G.rock = rock;
+figure; plotToolbar(G,rock); 
+view(-45,30)
+plotGrid(Gb, 'facealpha',0); plotGrid(Gt,'facealpha',0);
+axis equal tight
+gravity on
+
+
+%% Define fluid properties
+% Define a two-phase fluid model without capillarity. The fluid model has
+% the values:
+%
+% * densities: [rho_w, rho_o] = [1000 700 250] kg/m^3
+% * viscosities: [mu_w, mu_o] = [1 5 0.2] cP.
+% * corey-coefficient: [2, 2] = [2 2 2].
+
+fluid = initSimpleADIFluid('phases', 'OW', ...
+                            'mu',      [1, 5]*centi*poise, ...
+                            'rho',     [1000, 700]*kilogram/meter^3 , ...
+                            'n',       [2, 2]);
+
+fluid0 = fluid; % Incompressible fluid
+
+ pRef = 100*barsa;
+ c_w = 1e-8/barsa;
+ c_o = 1e-5/barsa;
+% c_g = 1e-3/barsa;
+% 
+% % Add compressibility to the fluid
+% fluid.bW = @(p) exp((p - pRef)*c_w);
+% fluid.bO = @(p) exp((p - pRef)*c_o);
+% fluid.bG = @(p) exp((p - pRef)*c_g);
+
+%% Define three-phase compressible flow model
+
+% We define a three phase blackoil model without dissolved gas or vaporized
+% oil. This is done by first instansiating the blackoil model, and then
+% manually passing in the internal transmissibilities and the topological
+% neighborship from the embedded fracture grid.
+
+% model = ThreePhaseBlackOilModel(G, [], fluid, 'disgas', false, 'vapoil', false);
+ model0.operators = setupOperatorsTPFA(G, G.rock);
+
+%% Add wells
+% We have a single horizontal gas injector that injects a total of one pore
+% volume of gas at surface conditions over a period of 'totTime' years. A
+% horizontal producer is also added to the top and set to bottom hole
+% pressure controls of 100 bar.
+
+totTime = 1*year;
+tpv = sum(model0.operators.pv);
+
+% inj = 1:nx*ny:nx*ny*(nz-1)+1;
+% prod = nx*ny:nx*ny:nx*ny*nz;
+
+% inj = nx*ny*(nz-1)+1:nx:nx*ny*nz;
+% prod = nx:nx:nx*ny;
+inj = 1;
+prod = nx * ny;
+
+W = addWell([], G, rock, inj, 'Type', 'rate', 'Val', tpv/totTime, 'Name', 'I', ...
+    'Sign', 1, 'Comp_i', [0, 1]);
+
+W = addWell(W, G, rock, prod, 'Type', 'bhp', 'Val', 100*barsa, 'Name', 'P', ...
+    'Sign', -1, 'Comp_i', [1, 0]/2);
+
+clf; plotCellData(G, rock.perm, 'facealpha', 0.3, 'edgealpha', 0.05); plotWell(G,W);
+axis tight equal; view(-135,30);
+pause
+%% Set up initial state and schedule
+% We set up a initial state with the reference pressure and a mixture of
+% water and oil initially. We also set up a simple-time step strategy that
+% ramps up gradually towards 30 day time-steps.
+
+s0 = [0.8, 0.2];
+state  = initResSol(G, pRef, s0);
+dt = rampupTimesteps(totTime, 30*day, 5);
+schedule0 = simpleSchedule(dt, 'W', W);
+%% Create and solve the same problem without any compressibility
+% Fractures can have a large impact on fluid displacement, but are often
+% associated with great uncertainty in terms of locations, orientation and
+% permeability. To demonstrate the effect of fractures on the transport, we
+% create another problem where the fractures themselves have been omitted.
+
+
+% Same model, but incompressible fluid
+model0 = TwoPhaseOilWaterModel(G, rock, fluid0);
+%model0 = ThreePhaseBlackOilModel(G, rock, fluid0, 'disgas', false, 'vapoil', false);
+state0  = initResSol(G, pRef, s0);
+
+% Make a copy of the wells in the new grid
+W0 = [];
+for i = 1:numel(W)
+    w = W(i);
+    W0 = addWell(W0, G, rock, w.cells, 'type', w.type, 'val', w.val, ...
+                 'wi', w.WI, 'comp_i', w.compi);
+end
+% Set up and simulate the schedule
+schedule0 = simpleSchedule(dt, 'W', W0);
+
+
+
+%% Run the entire fully implicit schedule
+% We simulate the schedule with a fully implicit scheme, i.e. where we
+% solve for both saturations and pressure simultanously.
+[wsFIMP, statesFIMP, repFIMP] = simulateScheduleAD(state0, model0, schedule0);
+
+%% Set up and simulate the schedule using a sequential implicit scheme
+% We convert the fully implicit model into a sequential model, a special
+% model which contains submodels for both the pressure and transport. In
+% this scheme, we first solve the pressure equation implicitly to obtain
+% total volumetric fluxes at reservoir conditions, as well as total well
+% rates. The pressure and fluxes are subsequently used as input for the
+% transport scheme, which advects the saturations in the total velocity
+% field using a fractional flow formulation.
+
+  mrstModule add agmg
+  %mrstModile add PCG_ICSol
+   %  solver = AGMGSolverAD('tolerance', 1e-5);
+    % solver = GMRES_ILUSolverAD('tolerance', 1e-5);
+     solver = PCG_ICSolverAD('tolerance', 1e-5,'maxIterations', 1000);
+ 
+%solver = DPCG_ICSolverAD('tolerance', tol,'maxIterations', 1000, 'Z',Z);
+% solver = BackslashSolverAD();
+% pressureSolver = BackslashSolverAD();
+
+
+seqModel = getSequentialModelFromFI(model0);
+[wsSeq, statesSeq, repSeq] = simulateScheduleAD(state0, seqModel, schedule0,'LinearSolver',solver );
+
+%% Simulate the schedule with the outer loop option enabled
+% In the sequential implicit scheme, the transport equations are derived by
+% assuming a fixed total velocity. For certain problems, this assumption is
+% not reasonable, and the total velocity may be strongly coupled to the
+% changes in saturation during a timestep. In this case, the problem is a
+% gas injection scenario where the injected gas has a much higher mobility
+% and much lower density, leading to significantly different results
+% between the fully implicit and the sequential implicit schemes.
+%
+% One way to improve the results of the sequential implicit scheme is to
+% employ an outer loop when needed. This amounts to revisiting the pressure
+% equation after the transport has converged and checking if the pressure
+% equation is still converged after the saturations have changed. If the
+% pressure equation has a large residual after the transport, we then
+% resolve the pressure with the new estimates for saturations.
+
+% Make a copy of the model
+seqModelOuter = seqModel;
+% Disable the "stepFunctionIsLinear" option, which tells the
+% NonLinearSolver that it is not sufficient to do a single pressure,
+% transport step to obtain convergence. We set the tolerance to 0.001
+% (which is also the default) which is roughly equivalent to the maximum
+% saturation error convergence criterion used in the fully implicit solver.
+seqModelOuter.stepFunctionIsLinear = false;
+seqModel.outerTolerance = 0.001;
+
+[wsOuter, statesOuter, repOuter] = simulateScheduleAD(state0, seqModelOuter, schedule0);
+
+%% Plot the results
+% We plot the results for the three different temporal discretization
+% schemes. Since the water is close to immobile and the injector and
+% producers are operated on gas and oil rates respectively, we plot the gas
+% production and the bottom hole pressure for each well.
+%
+% We clearly see that there are substantial differences in the well curves
+% due the changes in total velocity. The sequential implicit scheme with
+% the outer loop enabled is very close to the fully implicit solution and
+% will get closer if the tolerances are tightened.
+T = cumsum(schedule0.step.val);
+
+wellSols = {wsFIMP, wsSeq, wsOuter};
+states = {statesFIMP, statesSeq, statesOuter};
+names = {'Fully-implicit', 'Sequential-implicit', 'Sequential-outer'};
+markers = {'-', '--', '.'};
+
+close all;
+for i = 1:numel(wellSols)
+    figure(1); hold on
+    qo = -getWellOutput(wellSols{i}, 'qOs', 2)*day;
+    plot(T/day, qo, markers{i}, 'linewidth', 2)
+    xlabel('Time [days]');
+    ylabel('Gas production [m^3/day]');
+    
+    figure(2); hold on
+    bhp = getWellOutput(wellSols{i}, 'bhp', 2)/barsa;
+    plot(T/day, bhp, markers{i}, 'linewidth', 2)
+    xlabel('Time [days]');
+    ylabel('Producer bottom hole pressure [bar]');
+    
+    figure(3); hold on
+    bhp = getWellOutput(wellSols{i}, 'bhp', 1)/barsa;
+    plot(T/day, bhp, markers{i}, 'linewidth', 2)
+    xlabel('Time [days]');
+    ylabel('Injector bottom hole pressure [bar]');
+end
+
+% Add legends to the plots
+for i = 1:3
+    figure(i);
+    legend(names, 'location', 'northwest')
+end
+
+% Plot the different saturations and pressures
+figure;
+for i = 1:numel(names)
+    s = states{i};
+    
+    subplot(3, numel(names), i)
+    plotCellData(model0.G, s{end}.s(:, 1))
+    caxis([0, 1])
+    axis tight
+    title(names{i})
+    xlabel('Water saturation')
+    
+    subplot(3, numel(names), i+numel(names))
+    plotCellData(model0.G, s{end}.s(:, 2))
+    caxis([0, 1])
+    axis tight
+    xlabel('Oil saturation')
+%     
+    subplot(3, numel(names), i + 2*numel(names))
+    plotCellData(model0.G, s{end}.pressure)
+    axis tight
+    xlabel('Pressure')
+end
+%% Set up interactive plotting
+% We finish the example by launching interactive viewers for the well
+% curves, as well as the different reservoir quantities.
+mrstModule add mrst-gui
+wsol = {wsSeq, wsFIMP, wsOuter};
+wnames = {'Sequential', 'FIMP', 'Outer loop'};
+states = {statesSeq, statesFIMP, statesOuter};
+
+for i = 1:numel(states)
+    figure(i), clf
+    plotToolbar(G, states{i});
+    title(wnames{i});
+    axis tight
+    view(20, 60);
+    plotWell(G, schedule0.control(1).W)
+end
+
+plotWellSols(wsol, T, 'datasetnames', wnames)
+
+
+%% Copyright notice
+
+% <html>
+% <p><font size="-1">
+% Copyright 2009-2016 SINTEF ICT, Applied Mathematics.
+% </font></p>
+% <p><font size="-1">
+% This file is part of The MATLAB Reservoir Simulation Toolbox (MRST).
+% </font></p>
+% <p><font size="-1">
+% MRST is free software: you can redistribute it and/or modify
+% it under the terms of the GNU General Public License as published by
+% the Free Software Foundation, either version 3 of the License, or
+% (at your option) any later version.
+% </font></p>
+% <p><font size="-1">
+% MRST is distributed in the hope that it will be useful,
+% but WITHOUT ANY WARRANTY; without even the implied warranty of
+% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+% GNU General Public License for more details.
+% </font></p>
+% <p><font size="-1">
+% You should have received a copy of the GNU General Public License
+% along with MRST.  If not, see
+% <a href="http://www.gnu.org/licenses/">http://www.gnu.org/licenses</a>.
+% </font></p>
+% </html>
